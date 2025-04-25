@@ -1,0 +1,132 @@
+AWS CodeDeploy Overview and Troubleshooting Guide:
+
+This document provides insights into AWS CodeDeploy operations, common deployment scenarios, and troubleshooting guidance.
+
+1. Deployment Strategies and Processes
+
+HalfAtATime Deployment: 
+When configured, this strategy initiates deployment on a portion of the instances. For example, with 9 instances, the deployment might start on 4. The deployment is considered successful once it completes on a specified threshold, such as 5 or more instances in this example.   
+
+CodeDeploy Agent Polling: 
+The CodeDeploy agent checks for new deployment requests every 45 seconds. This polling behavior is default and independent of specific deployment group configurations. Agent activity logs can be found at /var/log/aws/codedeploy-agent/codedeploy-agent.log. Deployment lifecycle details are logged in /opt/codedeploy-agent/deployment-root/deployment-logs/codedeploy-agent-deployments.log.   
+
+2. Common Deployment Issues and Resolutions
+
+No Instances Found: 
+Deployment fails if no instances match the deployment group's tags or Auto Scaling group settings. Verify that the tags correctly identify the target instances.   
+
+IAM Permission Errors:
+S3 Access: 
+If the CodeDeploy IAM role lacks permission to access the S3 bucket containing the application revision, deployment may fail. Ensure the role has the necessary S3 permissions (e.g., s3:GetObject). Double-check the revision location if permissions seem correct.   
+
+Auto Scaling Access: 
+Similar errors occur if the role lacks permissions for Auto Scaling operations. Grant the required permissions via IAM policies.   
+
+ECS Permissions: 
+For ECS deployments, the role needs permissions like ecs:DescribeServices, ecs:CreateTaskSet, ecs:UpdateServicePrimaryTaskSet, and ecs:DeleteTaskSet. The role must also have permissions to assume the ecsCodeDeployRole.   
+
+CloudWatch Logs: 
+Failures during task initialization (e.g., ResourceInitializationError) can occur if the ecsTaskExecutionRole lacks logs:CreateLogGroup permission.   
+
+Private Subnet Agent: 
+If the CodeDeploy agent runs in a private subnet, it might fail to poll commands due to denied access. Ensure the instance profile has codedeploy-commands-secure:* permissions and enable_auth_policy: true is set in the agent config.   
+
+Load Balancer (ELB/ALB) Errors:
+Target Group Weight: 
+Errors can occur if a green task set target group has non-zero weight before traffic shifting. Using a single target group per listener can help avoid this.   
+
+Listener Configuration: 
+Ensure the primary task set target group is correctly associated with the listener.   
+
+Target Health/Registration: 
+Deployment may fail if target groups are not correctly registered with the load balancer or if instances do not become healthy within the expected timeframe. This can happen if the target group isn't configured to receive traffic from the load balancer.   
+
+Security Group Rules: 
+Ensure security groups allow traffic between the load balancer and EC2 instances.   
+
+AppSpec File Issues:
+Missing File: 
+Deployment fails if the appspec.yml file is not found at the application root during the BeforeInstall phase.   
+
+Incorrect Region in ARN: 
+An InvalidParameterException related to an invalid region in an ARN can occur. Check the appspec.yml and task definition for correctness.   
+
+Lifecycle Hook Failures:
+ApplicationStop: This can fail if the CodeDeploy agent isn't running, previous deployment files were removed inappropriately, or due to networking issues in private subnets.   
+DownloadBundle: Failure often indicates the instance profile lacks S3 permissions.   
+BeforeInstall: Common causes include a missing AppSpec file or issues within specified scripts.   
+Install: May fail if existing files cannot be deleted from the target location.   
+Revision Mismatch During Scaling: If an Auto Scaling event occurs during deployment, new instances might launch with the older application revision. Use the UpdateDeploymentGroup API to ensure instances are updated to the correct revision.   
+
+3. Deployment Configurations and Details
+
+ECS Blue/Green Deployments:
+Requires specific ECS and Load Balancer permissions.   
+Configuration involves defining target group pairs and listener ARNs in the deployment group settings.   
+The appspec.yml file specifies the task definition ARN and load balancer container details.   
+Traffic shifting involves ModifyListener and ModifyRule API calls.   
+The default timeout to terminate the original (blue) task set after successful deployment is 5 minutes.   
+Lifecycle Hooks: Standard timeout for each lifecycle event hook is one hour. Certain events (like Start, Install, End) cannot be scripted depending on the deployment type (e.g., In-place, Blue/green, Auto Scaling). 
+
+Cross-Region Deployments: 
+CodeDeploy does not support deploying application revisions stored in an S3 bucket in a different region from the deployment group. Errors related to bucket endpoint access will appear in agent logs.  
+
+4. EC2 Deployment Lifecycle Events
+
+CodeDeploy manages EC2 deployments through a series of lifecycle events. Some are handled directly by the CodeDeploy agent, while others are managed by the CodeDeploy service, allowing for custom script execution at specific points.
+
+Events Managed by CodeDeploy Agent:
+Start: Initiates the deployment process.   
+DownloadBundle: Downloads the application revision artifact from the source (S3 or GitHub).   
+Install: Executes installation scripts.   
+Events Managed by CodeDeploy Service (Allowing Custom Scripts):
+ApplicationStop: Stops the application before the new revision is installed.   
+BeforeInstall: Runs tasks before the DownloadBundle and Install events.   
+AfterInstall: Runs tasks after the Install event completes.   
+ApplicationStart: Starts the application after installation.   
+ValidateService: Validates the deployment after ApplicationStart.   
+BlockTraffic / BeforeBlockTraffic / AfterBlockTraffic: Manages deregistration of instances from the load balancer. DeregisterTargets is executed by the CodeDeploy service.   
+AllowTraffic / BeforeAllowTraffic / AfterAllowTraffic: Manages registration of instances with the load balancer. RegisterTargets is executed by the CodeDeploy service.   
+
+5. ECS Blue/Green Deployment
+
+Overview: For ECS (and Lambda) deployments, API calls are triggered by the CodeDeploy service. A Blue/Green deployment typically requires one listener and two target groups. If underlying resources (like target groups or listeners) are deleted and recreated, the ECS service must also be recreated due to changes in resource ARNs.   
+Key API Calls:
+BlockTraffic Hook: ModifyListener and ModifyRule actions are performed by CodeDeploy. ModifyRule is triggered if the target group uses non-default rules.   
+Install Hook: CreateTaskSet is performed by CodeDeploy.   
+AllowTraffic Hook: RegisterTargets is performed by CodeDeploy.   
+General API Calls: DescribeServices, UpdateServicePrimaryTaskSet, DescribeTargetGroups, DescribeRules, DescribeListeners, DescribeTargetHealth, DeregisterTargets, DeleteTaskSet are used throughout the process.   
+
+6. EC2 In-Place Deployment with Load Balancer
+
+Minimum Permissions (Agent): The CodeDeploy agent, assuming the service IAM role, requires the following minimum permissions to initiate the deployment. Failure to provide these can cause deployment failure before lifecycle hooks execute:
+ec2:DescribeInstances    
+ec2:DescribeInstanceStatus    
+  
+Permissions for Traffic Hooks (Service): The CodeDeploy service, assuming the service IAM role, performs the following operations and requires corresponding permissions:
+BlockTraffic: Requires elasticloadbalancing:DescribeTargetGroups, elasticloadbalancing:DeregisterTargets, elasticloadbalancing:DescribeTargetHealth.   
+AllowTraffic: Requires elasticloadbalancing:RegisterTargets, elasticloadbalancing:DescribeTargetHealth.   
+  
+7. Cross-Account Deployment
+
+Setup: CodeDeploy can facilitate deployments using artifacts stored in a different AWS account.
+Account A (Artifact Source): Create an S3 bucket and configure its policy to grant the instance profile IAM role in Account B the necessary S3 permissions (e.g., s3:GetObject).   
+Account B (Deployment Target): Create the CodeDeploy application and deployment group, referencing the artifact in Account A's S3 bucket, and initiate the deployment.   
+  
+8. CodeDeploy Agent Installation Methods
+
+The CodeDeploy agent can be installed on EC2 instances using various methods:   
+
+User Data: Include installation scripts in the launch template's user data.   
+AWS Systems Manager (SSM): Use SSM Run Command or State Manager to install the agent.   
+AMI Baking: Pre-install the agent in a stopped state within a custom Amazon Machine Image (AMI) and start it later using a script.  
+
+9. CreateDeployment Process Flow
+
+When a deployment is triggered via CreateDeployment:   
+
+CodeDeploy generates a unique deployment ID.   
+The CodeDeploy agent identifies target instances based on tags and validates their status.   
+The agent downloads the application revision from the source (e.g., S3).   
+The agent begins executing the defined lifecycle events.   
+This revised document aims for a more structured and professional presentation of the provided CodeDeploy information.
